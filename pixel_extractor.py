@@ -11,7 +11,7 @@ from PIL import Image
 # ============================================================
 # UI CONFIG
 # ============================================================
-WINDOW_W, WINDOW_H = 1200, 700
+WINDOW_W, WINDOW_H = 1400, 800
 LEFT_W = WINDOW_W // 2
 RIGHT_W = WINDOW_W - LEFT_W
 
