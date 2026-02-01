@@ -1,4 +1,3 @@
-import sys
 import time
 import struct
 import argparse
@@ -96,8 +95,39 @@ def rgba32_to_rgb24(rgba: np.ndarray, bg=(0, 0, 0)) -> np.ndarray:
     return out.astype(np.uint8)
 
 
+def extract_rgba_tile(arr_rgba: np.ndarray, x0: int, y0: int, tile_w: int = 32, tile_h: int = 32) -> np.ndarray:
+    """
+    Return a (tile_h, tile_w, 4) uint8 RGBA tile whose top-left in SOURCE coords is (x0,y0).
+
+    - If (x0,y0) is negative, the source is shifted right/down inside the tile.
+    - If (x0,y0) is beyond the source, remaining area is padded.
+    - Any out-of-bounds area is padded with transparent black.
+    """
+    src_h, src_w, _ = arr_rgba.shape
+    tile = np.zeros((tile_h, tile_w, 4), dtype=np.uint8)
+
+    # Intersection in source coords
+    sx1 = max(0, x0)
+    sy1 = max(0, y0)
+    sx2 = min(src_w, x0 + tile_w)
+    sy2 = min(src_h, y0 + tile_h)
+
+    if sx2 <= sx1 or sy2 <= sy1:
+        return tile  # no overlap
+
+    # Where that intersection lands in tile coords
+    tx1 = sx1 - x0
+    ty1 = sy1 - y0
+    tx2 = tx1 + (sx2 - sx1)
+    ty2 = ty1 + (sy2 - sy1)
+
+    tile[ty1:ty2, tx1:tx2, :] = arr_rgba[sy1:sy2, sx1:sx2, :]
+    return tile
+
+
 # =========================
 # Mapping: from (x,y) to physical wiring/order on 4-panel display
+# (pulled from your working script)
 # =========================
 def xy_to_index_1panel_serpentine(x, y, panel_w=32, panel_h=8):
     # idx = 0 in lower right, serpentine to idx = 255 in lower left
@@ -119,28 +149,28 @@ def xy_to_index_4panels_serpentine(x, y, panel_w=32, panel_h=8):
     return panel * (panel_w * panel_h) + idx_in_panel
 
 
-def build_index_map(W=32, H=32):
+def build_index_map():
     """
-    index_map[p] = (y, x) for physical pixel index p.
-    So physical-order pixels = rgb[index_map[:,0], index_map[:,1]]
+    INDEX_MAP[p] = (y, x) for physical pixel index p.
+    So physical-order pixels = rgb[INDEX_MAP[:,0], INDEX_MAP[:,1]]
     """
     coords = np.zeros((W * H, 2), dtype=np.int32)
     for y in range(H):
         for x in range(W):
-            p = xy_to_index_4panels_serpentine(x, y, panel_w=W, panel_h=8)
+            p = xy_to_index_4panels_serpentine(x, y)
             coords[p] = (y, x)
     return coords
 
 
-def frame_rgb_rowmajor_to_physical_payload(rgb_rowmajor: bytes, index_map: np.ndarray, W=32, H=32) -> bytes:
+def frame_rgb_rowmajor_to_physical_payload(rgb_rowmajor: bytes, index_map: np.ndarray) -> bytes:
     """
-    rgb_rowmajor: RGBRGB... row-major for a (H,W) frame
+    rgb_rowmajor: RGBRGB... row-major for a (32,32) frame
+    index_map: (N,2) mapping physical index -> (y,x)
     returns payload bytes in physical LED order RGBRGB...
     """
     rgb = np.frombuffer(rgb_rowmajor, dtype=np.uint8).reshape((H, W, 3))
     ordered = rgb[index_map[:, 0], index_map[:, 1]]  # (N,3)
     return ordered.astype(np.uint8, copy=False).tobytes()
-
 
 
 # =========================
@@ -150,7 +180,6 @@ def load_npy(path: Path) -> np.ndarray:
     arr = np.load(path)
     if arr.ndim != 3 or arr.shape[2] != 4:
         raise ValueError(f"Expected (H,W,4) RGBA array, got shape {arr.shape}")
-    # normalize dtype if needed
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
     return arr
@@ -172,6 +201,10 @@ def clamp(v, lo, hi):
 
 
 def draw_selection_overlay(screen, img_rect, sel_x, sel_y, zoom, show_grid=True):
+    """
+    Draws the 32x32 selection rect in screen coords.
+    Note: if sel_x/sel_y are negative, the rect can extend outside the image.
+    """
     sx = img_rect.x + int(sel_x * zoom)
     sy = img_rect.y + int(sel_y * zoom)
     sw = int(32 * zoom)
@@ -190,7 +223,7 @@ def draw_selection_overlay(screen, img_rect, sel_x, sel_y, zoom, show_grid=True)
 def main():
     ap = argparse.ArgumentParser(description="Load RGBA .npy, select 32x32, send via framing protocol with physical mapping.")
     ap.add_argument("npy", type=str, help="Path to .npy containing (H,W,4) uint8 RGBA")
-    ap.add_argument("--port", type=str, default="/dev/ttyACM0", help="Serial port (e.g. /dev/ttyACM0 or COM5). Empty = no sending.")
+    ap.add_argument("--port", type=str, default="", help="Serial port (e.g. /dev/ttyACM0 or COM5). Empty = no sending.")
     ap.add_argument("--baud", type=int, default=2000000, help="Baud rate (keep consistent with your setup).")
     ap.add_argument("--send_fps", type=float, default=20.0, help="Continuous send FPS when streaming is enabled.")
     ap.add_argument("--zoom", type=int, default=16, help="Initial zoom (screen pixels per image pixel).")
@@ -216,7 +249,6 @@ def main():
         if serial is None:
             raise RuntimeError("pyserial not installed. Install with: pip install pyserial")
         ser = serial.Serial(args.port, args.baud, timeout=0)
-        # Teensy often resets on open; short pause helps
         time.sleep(0.8)
         try:
             ser.reset_input_buffer()
@@ -238,16 +270,47 @@ def main():
     zoom = float(max(1, args.zoom))
     show_grid = not args.no_grid
 
-    # Selection top-left in image coords
+    # Selection top-left in SOURCE coords.
+    # Can be negative when the source is smaller than 32x32 (to position it inside the tile).
     sel_x = 0
     sel_y = 0
 
+    def selection_bounds():
+        """
+        Returns (min_x, max_x, min_y, max_y) for sel_x/sel_y.
+
+        - If source >= 32 in a dimension: keep the 32x32 window fully in-bounds.
+        - If source < 32: allow negatives so you can position/center the small source inside the 32x32 tile.
+          Example: img_w=16 -> allow sel_x in [-16, 0], so x0=-8 centers it.
+        """
+        if img_w >= W:
+            min_x, max_x = 0, img_w - W
+        else:
+            min_x, max_x = -(W - img_w), 0
+
+        if img_h >= H:
+            min_y, max_y = 0, img_h - H
+        else:
+            min_y, max_y = -(H - img_h), 0
+
+        return int(min_x), int(max_x), int(min_y), int(max_y)
+
     def clamp_selection():
         nonlocal sel_x, sel_y
-        sel_x = int(clamp(sel_x, 0, max(0, img_w - 32)))
-        sel_y = int(clamp(sel_y, 0, max(0, img_h - 32)))
+        min_x, max_x, min_y, max_y = selection_bounds()
+        sel_x = int(clamp(sel_x, min_x, max_x))
+        sel_y = int(clamp(sel_y, min_y, max_y))
 
-    clamp_selection()
+    # Start centered when the source is smaller than 32x32
+    def center_small_sources():
+        nonlocal sel_x, sel_y
+        if img_w < W:
+            sel_x = -((W - img_w) // 2)
+        if img_h < H:
+            sel_y = -((H - img_h) // 2)
+        clamp_selection()
+
+    center_small_sources()
 
     def compute_img_rect():
         scaled_w = int(img_w * zoom)
@@ -268,21 +331,22 @@ def main():
     send_period = 1.0 / max(0.1, float(args.send_fps))
     last_send_t = 0.0
 
-    brightness = 64  # start here; tweak as you like
+    brightness = 64  # start here
 
     # Edge-trigger for Enter
     enter_was_down = False
 
-    # Flash indicator
+    # Flash indicators
     last_send_ms = 0
     last_blank_ms = 0
 
     def build_current_frame_rowmajor_rgb() -> bytes:
         """
-        Returns 32x32 RGB row-major bytes (RGBRGB...) after compositing alpha over bg.
+        Always returns 32x32 RGB row-major bytes (RGBRGB...) after compositing RGBA over bg.
+        Works for arbitrary source sizes via padded extraction.
         """
-        crop = arr[sel_y:sel_y + 32, sel_x:sel_x + 32, :]
-        rgb = rgba32_to_rgb24(crop, bg=bg)
+        tile_rgba = extract_rgba_tile(arr, sel_x, sel_y, W, H)  # always (32,32,4)
+        rgb = rgba32_to_rgb24(tile_rgba, bg=bg)
         return rgb.tobytes(order="C")
 
     def send_rowmajor_rgb(rgb_rowmajor: bytes):
@@ -291,8 +355,6 @@ def main():
             return
 
         dimmed = apply_brightness_linear(rgb_rowmajor, brightness)
-        
-        # Convert row-major -> physical LED order
         payload = frame_rgb_rowmajor_to_physical_payload(dimmed, index_map)
         pkt = build_packet(payload, seq)
         seq = (seq + 1) & 0xFFFFFFFF
@@ -304,10 +366,9 @@ def main():
 
     def blank_display():
         nonlocal last_blank_ms
-        rgb0 = bytes(W * H * 3)  # already "row-major black"
-        # brightness doesn't matter if it's all zeros, but leave it consistent:
+        rgb0 = bytes(W * H * 3)  # row-major black
         payload = frame_rgb_rowmajor_to_physical_payload(rgb0, index_map)
-        pkt = build_packet(payload, seq=0)  # seq doesn't really matter for blank
+        pkt = build_packet(payload, seq=0)
         if ser:
             ser.write(pkt)
         last_blank_ms = pygame.time.get_ticks()
@@ -337,6 +398,10 @@ def main():
                     # Blank now
                     elif event.key == pygame.K_b:
                         blank_display()
+
+                    # Re-center small sources quickly
+                    elif event.key == pygame.K_c:
+                        center_small_sources()
 
                     # Brightness controls
                     elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -369,10 +434,10 @@ def main():
                         clamp_selection()
 
                     # Zoom keys
-                    elif event.key in (pygame.K_PAGEUP,):
+                    elif event.key == pygame.K_PAGEUP:
                         zoom = min(64.0, zoom * 1.1)
                         img_rect = compute_img_rect()
-                    elif event.key in (pygame.K_PAGEDOWN,):
+                    elif event.key == pygame.K_PAGEDOWN:
                         zoom = max(1.0, zoom / 1.1)
                         img_rect = compute_img_rect()
 
@@ -409,7 +474,6 @@ def main():
                     clamp_selection()
 
                 elif event.type == pygame.MOUSEWHEEL:
-                    # pygame 2 wheel event
                     zoom_factor = 1.0 + (0.10 * event.y)
                     zoom = clamp(zoom * zoom_factor, 1.0, 64.0)
                     img_rect = compute_img_rect()
@@ -423,11 +487,12 @@ def main():
             draw_selection_overlay(screen, img_rect, sel_x, sel_y, zoom, show_grid=show_grid)
 
             # HUD
+            min_x, max_x, min_y, max_y = selection_bounds()
             hud = [
-                f"Image: {img_w}x{img_h}  sel=({sel_x},{sel_y})  zoom={zoom:.1f}x",
+                f"Image: {img_w}x{img_h}  sel=({sel_x},{sel_y})  bounds x:[{min_x},{max_x}] y:[{min_y},{max_y}]  zoom={zoom:.1f}x",
                 f"Streaming: {'ON' if streaming else 'OFF'}   send_fps={args.send_fps:g}",
                 f"Brightness: {brightness}/255    [-/+]=8  [[]=1  0=off  9=full",
-                "Enter: send once   Space: toggle stream   B: blank now   G: grid   Esc/close: quit+blank",
+                "Enter: send once   Space: toggle stream   B: blank now   C: center small   G: grid   Esc/close: quit+blank",
             ]
             y = 8
             for line in hud:
