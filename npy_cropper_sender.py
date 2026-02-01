@@ -191,7 +191,7 @@ def draw_selection_overlay(screen, img_rect, sel_x, sel_y, zoom, show_grid=True)
 def main():
     ap = argparse.ArgumentParser(description="Load RGBA .npy, select 32x32, send via framing protocol with physical mapping.")
     ap.add_argument("npy", type=str, help="Path to .npy containing (H,W,4) uint8 RGBA")
-    ap.add_argument("--port", type=str, default="", help="Serial port (e.g. /dev/ttyACM0 or COM5). Empty = no sending.")
+    ap.add_argument("--port", type=str, default="/dev/ttyACM0", help="Serial port (e.g. /dev/ttyACM0 or COM5). Empty = no sending.")
     ap.add_argument("--baud", type=int, default=2000000, help="Baud rate (keep consistent with your setup).")
     ap.add_argument("--send_fps", type=float, default=20.0, help="Continuous send FPS when streaming is enabled.")
     ap.add_argument("--zoom", type=int, default=16, help="Initial zoom (screen pixels per image pixel).")
