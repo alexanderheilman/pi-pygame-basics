@@ -98,7 +98,6 @@ def rgba32_to_rgb24(rgba: np.ndarray, bg=(0, 0, 0)) -> np.ndarray:
 
 # =========================
 # Mapping: from (x,y) to physical wiring/order on 4-panel display
-# (pulled from your working script)
 # =========================
 def xy_to_index_1panel_serpentine(x, y, panel_w=32, panel_h=8):
     # idx = 0 in lower right, serpentine to idx = 255 in lower left
@@ -120,28 +119,28 @@ def xy_to_index_4panels_serpentine(x, y, panel_w=32, panel_h=8):
     return panel * (panel_w * panel_h) + idx_in_panel
 
 
-def build_index_map():
+def build_index_map(W=32, H=32):
     """
-    INDEX_MAP[p] = (y, x) for physical pixel index p.
-    So physical-order pixels = rgb[INDEX_MAP[:,0], INDEX_MAP[:,1]]
+    index_map[p] = (y, x) for physical pixel index p.
+    So physical-order pixels = rgb[index_map[:,0], index_map[:,1]]
     """
     coords = np.zeros((W * H, 2), dtype=np.int32)
     for y in range(H):
         for x in range(W):
-            p = xy_to_index_4panels_serpentine(x, y)
+            p = xy_to_index_4panels_serpentine(x, y, panel_w=W, panel_h=8)
             coords[p] = (y, x)
     return coords
 
 
-def frame_rgb_rowmajor_to_physical_payload(rgb_rowmajor: bytes, index_map: np.ndarray) -> bytes:
+def frame_rgb_rowmajor_to_physical_payload(rgb_rowmajor: bytes, index_map: np.ndarray, W=32, H=32) -> bytes:
     """
-    rgb_rowmajor: RGBRGB... row-major for a (32,32) frame
-    index_map: (N,2) mapping physical index -> (y,x)
+    rgb_rowmajor: RGBRGB... row-major for a (H,W) frame
     returns payload bytes in physical LED order RGBRGB...
     """
     rgb = np.frombuffer(rgb_rowmajor, dtype=np.uint8).reshape((H, W, 3))
     ordered = rgb[index_map[:, 0], index_map[:, 1]]  # (N,3)
     return ordered.astype(np.uint8, copy=False).tobytes()
+
 
 
 # =========================
@@ -292,6 +291,8 @@ def main():
             return
 
         dimmed = apply_brightness_linear(rgb_rowmajor, brightness)
+        
+        # Convert row-major -> physical LED order
         payload = frame_rgb_rowmajor_to_physical_payload(dimmed, index_map)
         pkt = build_packet(payload, seq)
         seq = (seq + 1) & 0xFFFFFFFF
